@@ -1,0 +1,227 @@
+pipeline {
+  agent {
+    kubernetes {
+      label 'dotnet'
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+labels:
+  component: ci
+spec:
+  # Use service account that can deploy to all namespaces
+  containers:
+  - name: dotnetsonar
+    image: nosinovacao/dotnet-sonar:latest
+    command:
+    - cat
+    tty: true
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:v1.7.0-debug
+    command:
+    - sleep
+    args:
+    - 999999
+    tty: true
+  - name: dotnet-helm
+    image: akscontainerregistry01s9s9s.azurecr.io/jenkins/dotnet-docker-kubectl-helm:1.0
+    command:
+    - cat
+    tty: true
+"""
+        }
+    }
+    environment {
+        HELM_EXPERIMENTAL_OCI=1
+        registryName = "akscontainerregistry01s9s9s"
+        def TAG = VersionNumber([ versionNumberString: '${BUILDS_ALL_TIME}', projectStartDate: '2021-12-21', versionPrefix: '1.0.0'] )
+    }
+    stages {
+        stage('Code Checkout') {
+            steps {
+                container('dotnetsonar') {
+                    git credentialsId: '993d7b3d-f038-4680-be5f-e6491d370c38', url: 'https://github.corp.vantagerisk.com/vantagerisk-llc/Digital-Connect-Address-API.git', branch: 'develop'
+                }
+            }
+        }
+        stage('Restore Packages'){
+            steps{
+                container('dotnetsonar') {
+                    sh 'dotnet nuget add source https://artifactory.corp.vantagerisk.com/artifactory/api/nuget/v3/digital-connect-nuget -n DC'
+                    sh 'dotnet restore src/Vantage.Digital.Address.API/Vantage.Digital.Address.API.csproj --configfile Nuget.config'
+                }
+            }
+        }
+        stage('Clean') {
+            steps {
+                container('dotnetsonar') {
+                    sh 'dotnet clean Vantage.Digital.Address.sln --configuration Release'
+                }
+            }
+        }
+        /*stage('Dotnet Build') {
+            steps {
+                container('dotnetsdk') {
+                    sh 'dotnet build "src/Vantage.Digital.Address.API/Vantage.Digital.Address.API.csproj" -c Release'
+                }
+            }
+        }
+
+        stage('UnitTest') {
+            steps {
+                container('dotnetsdk') {
+                    sh 'dotnet test --logger "trx;LogFileName=UnitTests.trx"'
+                }
+            }
+        }*/
+        stage('Build && Test && SonarQube Analysis') {
+            steps {
+                container('dotnetsonar') {
+                    sh 'dotnet tool install --global dotnet-sonarscanner'
+                    sh 'dotnet tool install --global dotnet-reportgenerator-globaltool'
+                    sh 'export PATH="$PATH:/root/.dotnet/tools"'
+                    script {
+                        env.sonarHome = tool 'MSBuild_Sonarscanner'
+                    }
+                    withSonarQubeEnv('Sonarqube') {
+                        sh 'dotnet ${sonarHome}/SonarScanner.MSBuild.dll begin \
+                        /k:"DigitalConnect-AddressAPI" \
+                        /d:sonar.login="0ed0922b168288e687d8fbcf57e5d40c54a85802" \
+                        /d:sonar.coverageReportPaths="coverage/SonarQube.xml"'
+                        sh 'dotnet build src/Vantage.Digital.Address.API/Vantage.Digital.Address.API.csproj -c Release --no-restore'
+                        sh 'dotnet test --logger "trx;LogFileName=UnitTests.trx" --collect:"XPlat Code Coverage" --results-directory ./coverage'
+                        sh '/root/.dotnet/tools/reportgenerator "-reports:./coverage/*/coverage.cobertura.xml" "-targetdir:coverage" "-reporttypes:SonarQube"'
+                        sh 'dotnet ${sonarHome}/SonarScanner.MSBuild.dll end /d:sonar.login="0ed0922b168288e687d8fbcf57e5d40c54a85802"'
+                    }
+                }
+            }
+        }
+        /*stage('Quality Gate') {
+            steps {
+                container('dotnetsonar') {
+                    sh 'sleep 10'
+                    //timeout(time: 5, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: true
+                    //}
+                }
+            }
+        }*/    
+        stage('Package Artifacts') {
+            steps {
+                container('dotnetsonar') {
+                    script {
+                        env.TAG = VersionNumber([ versionNumberString: '${BUILDS_ALL_TIME}', projectStartDate: '2021-12-21', versionPrefix: '1.0.0.0'] )
+                        sh 'dotnet pack Vantage.Digital.Address.sln -p:PackageVersion=$TAG -c Release --no-restore --no-build -o /home/jenkins/agent/workspace/DC-Address-API/artifacts'
+                    }
+                }
+            }
+        }
+        stage('Publish Artifacts') {
+            steps {
+                container('dotnetsonar') {
+                    sh 'mkdir publish'
+                    sh 'dotnet publish "src/Vantage.Digital.Address.API/Vantage.Digital.Address.API.csproj" -c Release -o publish'
+                }
+            }
+        }
+           
+        stage('Image Build') {
+            steps {
+                container('kaniko') {
+                    script {
+                        sh 'echo "{\\"auths\\": {\\"akscontainerregistry01s9s9s.azurecr.io\\":{\\"auth\\":\\"YWtzY29udGFpbmVycmVnaXN0cnkwMXM5czlzOmc4UmhjVy9LaTF6eVRDYTJpb0MzSGd4M2FlMzJGPTlj\\"}}}" > /kaniko/.docker/config.json'
+                    }
+                    echo "TAG: ${TAG}"
+                    sh "/kaniko/executor -f ./Dockerfile -c . -d akscontainerregistry01s9s9s.azurecr.io/dc-address-api:${TAG}"                      
+                }
+            }
+        }
+        stage('Push Helmchart to ACR') {
+            steps {
+                container('dotnet-helm') {
+                    sh 'helm package deploy --version ${TAG}'
+                    sh 'ls -ltr'
+                    withCredentials([azureServicePrincipal('New-azure-SPN')]) {
+                        sh 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID'
+                        sh 'az account set -s $AZURE_SUBSCRIPTION_ID'
+                        sh 'az acr helm push --name akscontainerregistry01s9s9s AddressAPI-${TAG}.tgz'
+                    }
+                }
+            }
+        }
+        stage('Deploy to DEV') {
+            steps {
+                container('dotnet-helm') {
+                    sh 'export HELM_EXPERIMENTAL_OCI=1'
+                    sh 'helm registry login akscontainerregistry01s9s9s.azurecr.io --username akscontainerregistry01s9s9s --password g8RhcW/Ki1zyTCa2ioC3Hgx3ae32F=9c'
+                    sh 'helm repo add dc-address-api  https://akscontainerregistry01s9s9s.azurecr.io/helm/v1/repo --username akscontainerregistry01s9s9s --password g8RhcW/Ki1zyTCa2ioC3Hgx3ae32F=9c'
+                    sh 'helm repo list'
+                    sh 'helm repo update'
+                    withCredentials([kubeconfigContent(credentialsId: 'vantage-aks-kubeconfig', variable: 'KUBECONFIG_CONTENT')]) {
+                        sh 'mkdir ~/.kube'
+                        sh '''echo "$KUBECONFIG_CONTENT" > kubeconfig && cat kubeconfig > ~/.kube/config'''
+                        sh 'kubectl config view'
+                        sh 'kubectl get secret $(kubectl get sa jenkins -n dev -o jsonpath={.secrets[0].name}) -n dev -o jsonpath={.data.token} | base64 --decode'
+                        sh 'helm pull dc-address-api/AddressAPI --version ${TAG}'
+                        sh 'helm upgrade addressapidev --install ./AddressAPI-${TAG}.tgz --version ${TAG} -f deploy/values.yaml --set image.tag=${TAG}'
+                    }
+                }
+            }
+        }
+        stage('Deploy to QA') {
+            steps {
+                container('dotnet-helm') {
+                    sh 'export HELM_EXPERIMENTAL_OCI=1'
+                    sh 'helm registry login akscontainerregistry01s9s9s.azurecr.io --username akscontainerregistry01s9s9s --password g8RhcW/Ki1zyTCa2ioC3Hgx3ae32F=9c'
+                    sh 'helm repo add dc-address-api  https://akscontainerregistry01s9s9s.azurecr.io/helm/v1/repo --username akscontainerregistry01s9s9s --password g8RhcW/Ki1zyTCa2ioC3Hgx3ae32F=9c'
+                    sh 'helm repo list'
+                    sh ' helm repo update'
+                    withCredentials([kubeconfigContent(credentialsId: 'vantage-aks-kubeconfig-qa', variable: 'KUBECONFIG_CONTENT')]) {
+                        sh '''echo "$KUBECONFIG_CONTENT" > kubeconfig && cat kubeconfig > ~/.kube/config'''
+                        sh 'kubectl config view'
+                        sh 'kubectl get secret $(kubectl get sa jenkins -n qa -o jsonpath={.secrets[0].name}) -n qa -o jsonpath={.data.token} | base64 --decode'
+                        sh 'helm pull dc-address-api/AddressAPI --version ${TAG}'
+                        sh 'helm upgrade addressapiqa --install ./AddressAPI-${TAG}.tgz --version ${TAG} -f deploy/values.yaml --set image.tag=${TAG}'
+                    }
+                }
+            }
+        }
+        stage('Deploy to UAT') {
+            steps {
+                container('dotnet-helm') {
+                    sh 'export HELM_EXPERIMENTAL_OCI=1'
+                    sh 'helm registry login akscontainerregistry01s9s9s.azurecr.io --username akscontainerregistry01s9s9s --password g8RhcW/Ki1zyTCa2ioC3Hgx3ae32F=9c'
+                    sh 'helm repo add dc-address-api  https://akscontainerregistry01s9s9s.azurecr.io/helm/v1/repo --username akscontainerregistry01s9s9s --password g8RhcW/Ki1zyTCa2ioC3Hgx3ae32F=9c'
+                    sh 'helm repo list'
+                    sh 'helm repo update'
+                    withCredentials([kubeconfigContent(credentialsId: 'vantage-aks-kubeconfig-uat', variable: 'KUBECONFIG_CONTENT')]) {
+                        sh '''echo "$KUBECONFIG_CONTENT" > kubeconfig && cat kubeconfig > ~/.kube/config'''
+                        sh 'kubectl config view'
+                        sh 'kubectl get secret $(kubectl get sa jenkins -n uat -o jsonpath={.secrets[0].name}) -n uat -o jsonpath={.data.token} | base64 --decode'
+                        sh 'helm pull dc-address-api/AddressAPI --version ${TAG}'
+                        sh 'helm upgrade addressapiuat --install ./AddressAPI-${TAG}.tgz --version ${TAG} -f deploy/values.yaml --set image.tag=${TAG}'
+                    }
+                }
+            }
+        }
+        stage('Deploy to Staging') {
+            steps {
+                container('dotnet-helm') {
+                    sh 'export HELM_EXPERIMENTAL_OCI=1'
+                    sh 'helm registry login akscontainerregistry01s9s9s.azurecr.io --username akscontainerregistry01s9s9s --password g8RhcW/Ki1zyTCa2ioC3Hgx3ae32F=9c'
+                    sh 'helm repo add dc-address-api  https://akscontainerregistry01s9s9s.azurecr.io/helm/v1/repo --username akscontainerregistry01s9s9s --password g8RhcW/Ki1zyTCa2ioC3Hgx3ae32F=9c'
+                    sh 'helm repo list'
+                    sh 'helm repo update'
+                    withCredentials([kubeconfigContent(credentialsId: 'vantage-aks-kubeconfig-preprod', variable: 'KUBECONFIG_CONTENT')]) {
+                        sh '''echo "$KUBECONFIG_CONTENT" > kubeconfig && cat kubeconfig > ~/.kube/config'''
+                        sh 'kubectl config view'
+                        sh 'kubectl get secret $(kubectl get sa jenkins -n staging -o jsonpath={.secrets[0].name}) -n staging -o jsonpath={.data.token} | base64 --decode'
+                        sh 'helm pull dc-address-api/AddressAPI --version ${TAG}'
+                        //sh 'helm upgrade addressapistage --install ./AddressAPI-${TAG}.tgz --version ${TAG} -f deploy/values.yaml --set image.tag=${TAG}'
+                        sh 'helm install addressapistage ./AddressAPI-${TAG}.tgz --version ${TAG} -f deploy/values.yaml --set image.tag=${TAG}'
+                    }
+                }
+            }
+        }
+    }
+}
